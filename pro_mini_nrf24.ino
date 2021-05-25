@@ -4,6 +4,16 @@
  * Author: Brendan Doherty (2bndy5)
  */
 
+
+/**
+ * Arduino Pro Mini Low power Sleep Example
+ * https://gist.github.com/boseji/d4e031aa7ec14b498a7a6a1efedf6d55
+ */
+#include <avr/interrupt.h>
+#include <avr/sleep.h>
+#include <avr/power.h>
+#include <avr/wdt.h>
+
 /**
  * A simple example of sending data from 1 nRF24L01 transceiver to another.
  *
@@ -62,11 +72,84 @@ bool role = true;  // true = TX role, false = RX role
 // on every successful transmission
 float payload[2] = {0.0,0.0};
 
+// WDT entry Flag
+volatile uint8_t f_wdt=1;
 
 
+//////////////////////////////////////////////////////////////////////////
+// WDT Interrupt
 
+ISR(WDT_vect)
+{
+  if(f_wdt == 0)
+  {
+    f_wdt=1; // Reset the Flag
+  }
+  else
+  {
+    Serial.println(F("WDT Overrun!!!"));
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Sleep Configuration Function
+//   Also wake-up after
+
+void enterSleep(void)
+{
+  WDTCSR |= _BV(WDIE); // Enable the WatchDog before we initiate sleep
+
+  //set_sleep_mode(SLEEP_MODE_PWR_SAVE);    /* Some power Saving */
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);    /* Even more Power Savings */
+  sleep_enable();
+
+  /* Now enter sleep mode. */
+  sleep_mode();
+  sleep_bod_disable();  // Additionally disable the Brown out detector
+
+  /* The program will continue from here after the WDT timeout*/
+  sleep_disable(); /* First thing to do is disable sleep. */
+
+  /* Re-enable the peripherals. */
+  power_all_enable();
+}
+
+/*
+//(0b100001);  // 8 seconds
+//(0b100000);  // 4 seconds
+void myWatchdogEnable(const byte interval) 
+  {  
+  MCUSR = 0;                          // reset various flags
+  WDTCSR |= 0b00011000;               // see docs, set WDCE, WDE
+  WDTCSR =  0b01000000 | interval;    // set WDIE, and appropriate delay
+
+  wdt_reset();
+  set_sleep_mode (SLEEP_MODE_PWR_DOWN);  
+  sleep_mode();            // now goes to Sleep and waits for the interrupt
+  } 
+*/
 void setup() {
 
+  /*** Setup the WDT ***/
+  cli();
+  /* Clear the reset flag. */
+  MCUSR &= ~(1<<WDRF);
+
+  /* In order to change WDE or the prescaler, we need to
+  * set WDCE (This will allow updates for 4 clock cycles).
+  */
+  WDTCSR |= (1<<WDCE) | (1<<WDE);
+
+  /* set new watchdog timeout prescaler value */
+  //WDTCSR = 1<<WDP1 | 1<<WDP2;             /* 1.0 seconds */
+  //WDTCSR = 1<<WDP0 | 1<<WDP1 | 1<<WDP2; /* 2.0 seconds */
+  //WDTCSR = 1<<WDP3;                     /* 4.0 seconds */
+  WDTCSR = 1<<WDP0 | 1<<WDP3;           /* 8.0 seconds */
+
+  /* Enable the WD interrupt (note no reset). */
+  //WDTCSR |= _BV(WDIE); // Not here but when we go to Sleep
+  sei();
+  
   Serial.begin(9600);
   while (!Serial) {
     // some boards need to wait to ensure access to serial over USB
@@ -123,73 +206,99 @@ void setup() {
 
   dht.begin();
 
+  pinMode(9, OUTPUT);
+  digitalWrite(9,LOW);
+  
 } // setup
 
 void loop() {
-  // Wait a few seconds between measurements.
-  delay(2000);
 
-  // Reading temperature or humidity takes about 250 milliseconds!
-  // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
-  payload[1] = dht.readHumidity();
-  // Read temperature as Celsius (the default)
-  payload[0] = dht.readTemperature();
+  // Only Execute this part One time
+  if(f_wdt == 1) {
+
+    //////////////////////////
+    // PROCESSING BEGIN
+
+    digitalWrite(9,LOW);        // LED Indication ON
   
-  if (role) {
-    // This device is a TX node
-
-    unsigned long start_timer = micros();                    // start the timer
-    bool report = radio.write(&payload[0], sizeof(payload));      // transmit & save the report
-    unsigned long end_timer = micros();                      // end the timer
-
-    if (report) {
-      Serial.print(F("Transmission successful! "));          // payload was delivered
-      Serial.print(F("Time to transmit = "));
-      Serial.print(end_timer - start_timer);                 // print the timer result
-      Serial.print(F(" us. Sent: "));
-      Serial.println(payload[0]);                               // print payload sent
-      Serial.println(payload[1]);                               // print payload sent
+    // Wait a few seconds between measurements.
+    //delay(2000);
+  
+    // Reading temperature or humidity takes about 250 milliseconds!
+    // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+    payload[1] = dht.readHumidity();
+    // Read temperature as Celsius (the default)
+    payload[0] = dht.readTemperature();
+    
+    if (role) {
+      // This device is a TX node
+  
+      unsigned long start_timer = micros();                    // start the timer
+      bool report = radio.write(&payload[0], sizeof(payload));      // transmit & save the report
+      unsigned long end_timer = micros();                      // end the timer
+  
+      if (report) {
+        Serial.print(F("Transmission successful! "));          // payload was delivered
+        Serial.print(F("Time to transmit = "));
+        Serial.print(end_timer - start_timer);                 // print the timer result
+        Serial.print(F(" us. Sent: "));
+        Serial.println(payload[0]);                               // print payload sent
+        Serial.println(payload[1]);                               // print payload sent
+      } else {
+        Serial.println(F("Transmission failed or timed out")); // payload was not delivered
+      }
+  
+      // to make this example readable in the serial monitor
+      //delay(1000);  // slow transmissions down by 1 second
+  
     } else {
-      Serial.println(F("Transmission failed or timed out")); // payload was not delivered
+      // This device is a RX node
+  
+      uint8_t pipe;
+      if (radio.available(&pipe)) {             // is there a payload? get the pipe number that recieved it
+        uint8_t bytes = radio.getPayloadSize(); // get the size of the payload
+        radio.read(&payload[0], bytes);            // fetch payload from FIFO
+        Serial.print(F("Received "));
+        Serial.print(bytes);                    // print the size of the payload
+        Serial.print(F(" bytes on pipe "));
+        Serial.print(pipe);                     // print the pipe number
+        Serial.print(F(": "));
+        Serial.println(payload[0]);                // print the payload's value
+      }
+    } // role
+  
+    if (Serial.available()) {
+      // change the role via the serial monitor
+  
+      char c = toupper(Serial.read());
+      if (c == 'T' && !role) {
+        // Become the TX node
+  
+        role = true;
+        Serial.println(F("*** CHANGING TO TRANSMIT ROLE -- PRESS 'R' TO SWITCH BACK"));
+        radio.stopListening();
+  
+      } else if (c == 'R' && role) {
+        // Become the RX node
+  
+        role = false;
+        Serial.println(F("*** CHANGING TO RECEIVE ROLE -- PRESS 'T' TO SWITCH BACK"));
+        radio.startListening();
+      }
     }
 
-    // to make this example readable in the serial monitor
-    delay(1000);  // slow transmissions down by 1 second
+    delay(100);  // give time to serial
+    digitalWrite(9,HIGH);        // LED Indication OFF
+    
+    // PROCESSING END
+    //////////////////////////
 
-  } else {
-    // This device is a RX node
+    /* Don't forget to clear the flag. */
+    f_wdt = 0;
 
-    uint8_t pipe;
-    if (radio.available(&pipe)) {             // is there a payload? get the pipe number that recieved it
-      uint8_t bytes = radio.getPayloadSize(); // get the size of the payload
-      radio.read(&payload[0], bytes);            // fetch payload from FIFO
-      Serial.print(F("Received "));
-      Serial.print(bytes);                    // print the size of the payload
-      Serial.print(F(" bytes on pipe "));
-      Serial.print(pipe);                     // print the pipe number
-      Serial.print(F(": "));
-      Serial.println(payload[0]);                // print the payload's value
-    }
-  } // role
-
-  if (Serial.available()) {
-    // change the role via the serial monitor
-
-    char c = toupper(Serial.read());
-    if (c == 'T' && !role) {
-      // Become the TX node
-
-      role = true;
-      Serial.println(F("*** CHANGING TO TRANSMIT ROLE -- PRESS 'R' TO SWITCH BACK"));
-      radio.stopListening();
-
-    } else if (c == 'R' && role) {
-      // Become the RX node
-
-      role = false;
-      Serial.println(F("*** CHANGING TO RECEIVE ROLE -- PRESS 'T' TO SWITCH BACK"));
-      radio.startListening();
-    }
-  }
-
+    /* Re-enter sleep mode. */
+    enterSleep();
+    
+  } //if(f_wdt == 1)
+  
 } // loop
